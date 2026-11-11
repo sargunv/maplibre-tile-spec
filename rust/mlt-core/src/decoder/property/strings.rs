@@ -360,11 +360,12 @@ impl<'a> RawStrings<'a> {
 
         let parsed = match self.encoding {
             RawStringsEncoding::Plain(plain_data) => {
-                let (data, lengths) = plain_data.decode(dec)?;
+                let (data, lengths) = plain_data.decode_bytes(dec)?;
+                let (data, lengths) = utf8_strings(Cow::Borrowed(data), Cow::Owned(lengths))?;
                 ParsedStrings {
                     name,
                     lengths: to_absolute_lengths(&lengths, presence.as_deref(), dec)?,
-                    data: data.into(),
+                    data,
                 }
             }
             RawStringsEncoding::Dictionary {
@@ -385,11 +386,12 @@ impl<'a> RawStrings<'a> {
                 )?
             }
             RawStringsEncoding::FsstPlain(fsst_data) => {
-                let (data, dict_lens) = fsst_data.decode(dec)?;
+                let (data, lengths) = fsst_data.decode_bytes(dec)?;
+                let (data, lengths) = utf8_strings(Cow::Owned(data), Cow::Owned(lengths))?;
                 ParsedStrings {
                     name,
-                    lengths: to_absolute_lengths(&dict_lens, presence.as_deref(), dec)?,
-                    data: data.into(),
+                    lengths: to_absolute_lengths(&lengths, presence.as_deref(), dec)?,
+                    data,
                 }
             }
             RawStringsEncoding::FsstDictionary {
@@ -460,13 +462,79 @@ pub(crate) fn rebuild_dictionary<'d, 'l>(
     data: &'d [u8],
 ) -> MltResult<(Cow<'d, str>, Cow<'l, [u32]>)> {
     match dict {
-        DictLayout::Plain => Ok((Cow::Borrowed(str::from_utf8(data)?), Cow::Borrowed(lengths))),
+        DictLayout::Plain => utf8_strings(Cow::Borrowed(data), Cow::Borrowed(lengths)),
         #[cfg(feature = "unstable-v2")]
         DictLayout::FrontCoded => {
             let (entries, entry_lengths) = front_decode(FrontLengths::split(lengths)?, data)?;
-            Ok((Cow::Owned(entries), Cow::Owned(entry_lengths)))
+            utf8_strings(Cow::Owned(entries), Cow::Owned(entry_lengths))
         }
     }
+}
+
+/// Strings stored back to back with one byte length each, as UTF-8: invalid bytes in a string read
+/// as U+FFFD, as GL JS and `MapLibre Native` read MVT strings, rather than failing the tile.
+///
+/// The usual corpus costs one validation and is kept as it is, borrowed or owned: it is valid
+/// UTF-8 and every string ends on a character boundary. Any other is converted string by string,
+/// so an invalid sequence never runs from one string into the next, and the lengths follow the
+/// converted strings. A string running past the corpus keeps its length, for the reader to report
+/// as it would have; the conversion at most triples bytes the decoder already holds.
+pub(crate) fn utf8_strings<'d, 'l>(
+    data: Cow<'d, [u8]>,
+    lengths: Cow<'l, [u32]>,
+) -> MltResult<(Cow<'d, str>, Cow<'l, [u32]>)> {
+    let bytes = match data {
+        Cow::Borrowed(bytes) => match str::from_utf8(bytes) {
+            Ok(text) if ends_on_boundaries(text, &lengths) => {
+                return Ok((Cow::Borrowed(text), lengths));
+            }
+            _ => Cow::Borrowed(bytes),
+        },
+        Cow::Owned(bytes) => match String::from_utf8(bytes) {
+            Ok(text) if ends_on_boundaries(&text, &lengths) => {
+                return Ok((Cow::Owned(text), lengths));
+            }
+            Ok(text) => Cow::Owned(text.into_bytes()),
+            Err(e) => Cow::Owned(e.into_bytes()),
+        },
+    };
+    let (text, lengths) = replace_invalid_utf8(&bytes, &lengths)?;
+    Ok((Cow::Owned(text), Cow::Owned(lengths)))
+}
+
+/// Whether every string ends on a character boundary of `text`, or past its end.
+fn ends_on_boundaries(text: &str, lengths: &[u32]) -> bool {
+    let mut end = 0_usize;
+    lengths.iter().all(|&len| {
+        end = end.saturating_add(len.into_usize());
+        end >= text.len() || text.is_char_boundary(end)
+    })
+}
+
+/// Each string of `bytes` converted on its own, with its new byte length.
+#[cold]
+#[inline(never)]
+fn replace_invalid_utf8(bytes: &[u8], lengths: &[u32]) -> MltResult<(String, Vec<u32>)> {
+    let mut text = String::with_capacity(bytes.len());
+    let mut converted = Vec::with_capacity(lengths.len());
+    let mut start = 0_usize;
+    for &len in lengths {
+        let end = start.saturating_add(len.into_usize());
+        if let Some(value) = bytes.get(start..end) {
+            let from = text.len();
+            for chunk in value.utf8_chunks() {
+                text.push_str(chunk.valid());
+                if !chunk.invalid().is_empty() {
+                    text.push(char::REPLACEMENT_CHARACTER);
+                }
+            }
+            converted.push(u32::try_from(text.len() - from)?);
+        } else {
+            converted.push(len);
+        }
+        start = end;
+    }
+    Ok((text, converted))
 }
 
 fn decode_dictionary_strings<'a>(
@@ -709,6 +777,53 @@ mod tests {
     fn dictionary_entry_splitting_a_character() {
         let err = dictionary_rows(&[1, 1], "µ", &[0]).expect_err("entry splits a character");
         assert!(matches!(err, MltError::Utf8(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_valid_corpus_is_kept_as_it_is() {
+        let lengths = [1, 2, 1];
+        let (text, kept) =
+            utf8_strings(Cow::Borrowed("aµb".as_bytes()), Cow::Borrowed(&lengths)).unwrap();
+        assert!(matches!(text, Cow::Borrowed("aµb")), "{text:?}");
+        assert!(matches!(kept, Cow::Borrowed(&[1, 2, 1])), "{kept:?}");
+
+        let owned = b"ab".to_vec();
+        let at = owned.as_ptr();
+        let (text, _) = utf8_strings(Cow::Owned(owned), Cow::Borrowed(&[1, 1])).unwrap();
+        assert_eq!(text.as_ptr(), at);
+    }
+
+    #[rstest]
+    #[case::invalid_bytes(b"caf\xe9r\xffue", &[4, 4], "caf\u{fffd}r\u{fffd}ue", &[6, 6])]
+    #[case::an_owned_corpus(b"\xff", &[1], "\u{fffd}", &[3])]
+    #[case::a_character_split_between_strings("€".as_bytes(), &[2, 1], "\u{fffd}\u{fffd}", &[3, 3])]
+    #[case::a_string_past_the_corpus(b"\xffab", &[1, 9], "\u{fffd}", &[3, 9])]
+    fn invalid_utf8_in_a_string_reads_as_replacement_characters(
+        #[case] data: &[u8],
+        #[case] lengths: &[u32],
+        #[case] text: &str,
+        #[case] converted: &[u32],
+    ) {
+        for data in [Cow::Borrowed(data), Cow::Owned(data.to_vec())] {
+            let (got, got_lengths) = utf8_strings(data, Cow::Borrowed(lengths)).unwrap();
+            assert_eq!(got, text);
+            assert_eq!(&*got_lengths, converted);
+        }
+    }
+
+    #[test]
+    fn dictionary_entries_with_invalid_utf8_read_as_replacement_characters() {
+        let (dict, lengths) =
+            rebuild_dictionary(DictLayout::Plain, &[4, 3], b"caf\xe9rue").unwrap();
+        let rows = dictionary_rows(&lengths, &dict, &[1, 0, 0]).unwrap();
+        assert_eq!(
+            rows,
+            [
+                Some("rue".to_string()),
+                Some("caf\u{fffd}".to_string()),
+                Some("caf\u{fffd}".to_string())
+            ]
+        );
     }
 
     #[test]

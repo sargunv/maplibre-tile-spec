@@ -201,7 +201,7 @@ fn a_front_coded_fsst_corpus_decodes_to_the_whole_strings() {
 
 #[cfg(feature = "unstable-v2")]
 #[test]
-fn an_fsst_corpus_that_is_not_utf8_decodes_to_an_error() {
+fn an_fsst_corpus_that_is_not_utf8_decodes_with_replacement_characters() {
     let (tree, mut buf) = annotate(FSST_V2);
     let symbols = tree
         .regions
@@ -214,7 +214,7 @@ fn an_fsst_corpus_that_is_not_utf8_decodes_to_an_error() {
     buf[symbols.offset..symbols.offset + symbols.len].fill(0xFF);
     insta::assert_snapshot!(
         json(&decode_at(&tree, &buf, corpus_index(&tree), 0)),
-        @r#"{"kind":"error","message":"UTF-8 decode error: invalid utf-8 sequence of 1 bytes from index 0"}"#
+        @r#"{"kind":"strings","values":["����d�������������������������1","comm��ci���������ou����������2","i�du���i��������������������3","p��k������w�����������4","w�����������������������5","����d�������������ou����������6"],"truncatedFrom":null}"#
     );
 }
 

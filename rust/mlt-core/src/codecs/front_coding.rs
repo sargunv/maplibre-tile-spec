@@ -94,11 +94,12 @@ impl<'a> FrontLengths<'a> {
     }
 }
 
-/// Rebuild a front-coded dictionary into its entries back to back, with each entry's byte length.
+/// Rebuild a front-coded dictionary into its entries' bytes back to back, with each entry's byte
+/// length.
 pub(crate) fn front_decode(
     lengths: FrontLengths<'_>,
     suffixes: &[u8],
-) -> MltResult<(String, Vec<u32>)> {
+) -> MltResult<(Vec<u8>, Vec<u32>)> {
     let mut entries = Vec::with_capacity(suffixes.len());
     let mut entry_lengths = Vec::with_capacity(lengths.count());
     // Where the previous entry starts in `entries`, so its prefix can be copied forward.
@@ -140,7 +141,7 @@ pub(crate) fn front_decode(
     if !remaining.is_empty() {
         return Err(FrontCodedTrailingSuffixBytes(remaining.len()));
     }
-    Ok((String::from_utf8(entries)?, entry_lengths))
+    Ok((entries, entry_lengths))
 }
 
 /// How many leading bytes two entries share.
@@ -153,9 +154,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::MltError;
 
-    fn decode(lengths: &[u32], suffixes: &[u8]) -> MltResult<(String, Vec<u32>)> {
+    fn decode(lengths: &[u32], suffixes: &[u8]) -> MltResult<(Vec<u8>, Vec<u32>)> {
         front_decode(FrontLengths::split(lengths)?, suffixes)
     }
 
@@ -166,7 +166,7 @@ mod tests {
         let mut at = 0_usize;
         for len in lengths {
             let len = len as usize;
-            out.push(corpus[at..at + len].to_string());
+            out.push(String::from_utf8(corpus[at..at + len].to_vec()).unwrap());
             at += len;
         }
         out
@@ -257,11 +257,5 @@ mod tests {
     fn decode_rejects_an_odd_lengths_stream() {
         let err = decode(&[0, 1, 2], b"").unwrap_err();
         assert!(matches!(err, FrontCodedOddLengthCount(3)), "{err:?}");
-    }
-
-    #[test]
-    fn decode_rejects_a_corpus_that_is_not_utf8() {
-        let err = decode(&[0, 1], &[0xFF]).unwrap_err();
-        assert!(matches!(err, MltError::FromUtf8(_)), "{err:?}");
     }
 }
